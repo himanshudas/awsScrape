@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"github.com/dgryski/go-pcgr"
+	"github.com/valyala/fasthttp"
+	"io"
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"os"
-	"strings"
+	"sort"
 	"sync"
 	"time"
 )
@@ -23,18 +26,18 @@ type IPRange struct {
 }
 
 type checkIPRangeParams struct {
-	ipRange     string
-	keywordList []string
-	timeout     int
+	ipRange     []byte
+	keywordList [][]byte
+	timeout     time.Duration
 	verbose     bool
 }
 
-func parseCommandLineArguments() (string, string, int, int, bool, string, bool) {
+func parseCommandLineArguments() (string, string, int, time.Duration, bool, string, bool) {
 	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
 	shortWordlist := flag.String("w", "", "File containing keywords to search in SSL certificates (short form)")
 	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
 	numThreads := flag.Int("threads", 4, "Number of concurrent threads")
-	timeout := flag.Int("timeout", 1, "Timeout in seconds for SSL connection")
+	timeout := flag.Duration("timeout", 1*time.Second, "Timeout for SSL connection")
 	randomize := flag.Bool("randomize", false, "Randomize the order in which IP addresses are checked")
 	outputFile := flag.String("output", "", "Output file to save results")
 	verbose := flag.Bool("verbose", false, "Enable verbose mode")
@@ -46,6 +49,18 @@ func parseCommandLineArguments() (string, string, int, int, bool, string, bool) 
 	}
 
 	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile, *verbose
+
+}
+
+func pcgShuffle(n int, swap func(i, j int), pcgSource *pcgr.Rand) {
+	if n < 0 {
+		panic("invalid argument to pcgShuffle")
+	}
+	randSrc := rand.New(pcgSource)
+	for i := n - 1; i > 0; i-- {
+		j := randSrc.Intn(i + 1)
+		swap(i, j)
+	}
 }
 
 func main() {
@@ -56,154 +71,211 @@ func main() {
 		return
 	}
 
-	var keywordList []string
+	var keywordList [][]byte
 	if wordlist != "" {
-		keywords, err := ioutil.ReadFile(wordlist)
+		f, err := os.Open(wordlist)
 		if err != nil {
-			log.Println("Error reading wordlist file:", err)
-			return
+			log.Fatalf("Error opening wordlist file: %v", err)
 		}
-		lines := strings.Split(string(keywords), "\n")
-		for _, line := range lines {
-			if len(strings.TrimSpace(line)) > 0 {
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) > 0 {
 				keywordList = append(keywordList, line)
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			log.Fatalf("Error reading wordlist file: %v", err)
+		}
 	} else {
-		keywordList = []string{keyword}
+		keywordList = [][]byte{[]byte(keyword)}
 	}
 
-	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	var ipRanges IPRange
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+	req.SetRequestURI("https://ip-ranges.amazonaws.com/ip-ranges.json")
+
+	err := fasthttp.Do(req, resp)
 	if err != nil {
 		log.Println("Error fetching IP ranges:", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println("Error reading response body:", err)
-		return
-	}
-
-	var ipRanges IPRange
-	err = json.Unmarshal(data, &ipRanges)
-	if err != nil {
-		log.Println("Error parsing JSON:", err)
-		return
-	}
+	respBody := resp.Body()
+	dec := json.NewDecoder(bytes.NewReader(respBody))
 
 	if randomize {
-		rand.Seed(time.Now().UnixNano())
-		rand.Shuffle(len(ipRanges.Prefixes), func(i, j int) {
+		pcgSource := pcgr.New(time.Now().UnixNano(), 0)
+		pcgShuffle(len(ipRanges.Prefixes), func(i, j int) {
 			ipRanges.Prefixes[i], ipRanges.Prefixes[j] = ipRanges.Prefixes[j], ipRanges.Prefixes[i]
-		})
+		}, &pcgSource)
+
 	}
 
-	ipChan := make(chan string)
-	jobChan := make(chan checkIPRangeParams, numThreads)
+	var ipChan chan []byte
 
-	var wg sync.WaitGroup
-	wg.Add(numThreads)
-
-	for i := 0; i < numThreads; i++ {
-		go func() {
-			defer wg.Done()
-			for params := range jobChan {
-				checkIPRange(params, ipChan)
+	for dec.More() {
+		if err := dec.Decode(&ipRanges); err != nil {
+			if err == io.EOF {
+				break
 			}
-		}()
-	}
-
-	go func() {
+			log.Fatalf("Error parsing JSON: %v", err)
+		}
 		for _, prefix := range ipRanges.Prefixes {
 			params := checkIPRangeParams{
-				ipRange:     prefix.IPPrefix,
+				ipRange:     []byte(prefix.IPPrefix),
 				keywordList: keywordList,
 				timeout:     timeout,
 				verbose:     verbose,
 			}
-			jobChan <- params
+			go checkIPRange(params, numThreads, outputFile, ipChan)
 		}
-		close(jobChan)
-	}()
-
-	go func() {
-		wg.Wait()
-		close(ipChan)
-	}()
-
-	var output *os.File
-	if outputFile != "" {
-		output, err = os.Create(outputFile)
-		if err != nil {
-			log.Println("Error creating output file:", err)
-			return
-		}
-		defer output.Close()
 	}
+	wg := &sync.WaitGroup{}
 
-	for ip := range ipChan {
-		fmt.Print(ip)
-		if output != nil {
-			_, err := output.WriteString(ip)
-			if err != nil {
-				log.Println("Error writing to output file:", err)
+	ipChan = make(chan []byte, numThreads*10)
+
+	wg.Add(numThreads)
+	for i := 0; i < numThreads; i++ {
+		go func() {
+			defer wg.Done()
+			for ip := range ipChan {
+				if outputFile != "" {
+					if err := writeIPToFile(outputFile, ip); err != nil {
+						log.Printf("Error writing to output file: %v", err)
+					}
+				}
+				fmt.Printf("%s\n", ip)
 			}
-		}
+		}()
 	}
+
+	wg.Wait()
+	close(ipChan)
+
 }
 
-func checkIPRange(params checkIPRangeParams, ipChan chan<- string) {
-	_, ipNet, err := net.ParseCIDR(params.ipRange)
+func checkIPRange(params checkIPRangeParams, numThreads int, outputFile string, ipChan chan<- []byte) {
+	_, ipNet, err := net.ParseCIDR(string(params.ipRange))
 	if err != nil {
 		return
 	}
 
-	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
-		found := false
-		matchedKeywords := []string{}
-		for _, keyword := range params.keywordList {
-			if checkSSLKeyword(ip.String(), keyword, params.timeout) {
-				matchedKeywords = append(matchedKeywords, keyword)
-				found = true
-			}
-		}
-
-		if found {
-			if len(matchedKeywords) > 20 {
-				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(matchedKeywords))
-			} else {
-				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(matchedKeywords, ", "))
-			}
-		} else if params.verbose {
-			if len(params.keywordList) > 20 {
-				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(params.keywordList))
-			} else {
-				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(params.keywordList, ", "))
-			}
-		}
+	var pool sync.Pool
+	pool.New = func() interface{} {
+		return make([]byte, 0, 16)
 	}
+
+	keywordSorter := &keywordListSorter{params.keywordList}
+	sort.Sort(keywordSorter)
+
+	jobs := make(chan net.IP, numThreads)
+	wg := &sync.WaitGroup{}
+
+	for i := 0; i < numThreads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				ipStr := pool.Get().([]byte)
+				ipStr = ipStr[:0]
+				ipStr = ip.To4()
+				if ipStr == nil {
+					ipStr = []byte(ip.String())
+				} else {
+					ipStr = []byte(ipStr)
+				}
+
+				found, matchedKeywords := checkSSLKeyword(ipStr, keywordSorter, int(params.timeout/time.Second))
+				if found {
+					if len(matchedKeywords) > 20 {
+						ipStr = append(ipStr, []byte(fmt.Sprintf(" Matched keywords found in SSL certificate (Keywords checked: %d)\n", len(params.keywordList)))...)
+					} else {
+						ipStr = append(ipStr, []byte(fmt.Sprintf(" Matched keywords found in SSL certificate (Keywords: %s)\n", bytes.Join(matchedKeywords, []byte(", "))))...)
+					}
+					ipChan <- ipStr
+				} else if params.verbose {
+					if len(params.keywordList) > 20 {
+						ipStr = append(ipStr, []byte(fmt.Sprintf(" No matched keyword found in SSL certificate (Keywords checked: %d)\n", len(params.keywordList)))...)
+					} else {
+						ipStr = append(ipStr, []byte(fmt.Sprintf(" No matched keyword found in SSL certificate (Keywords: %s)\n", bytes.Join(params.keywordList, []byte(", "))))...)
+					}
+					ipChan <- ipStr
+				}
+				pool.Put(ipStr)
+			}
+		}()
+	}
+	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
+		jobs <- ip
+	}
+	close(jobs)
+
+	wg.Wait()
 }
 
-func checkSSLKeyword(ip, keyword string, timeout int) bool {
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Duration(timeout) * time.Second}, "tcp", ip+":443", &tls.Config{InsecureSkipVerify: true})
+type keywordListSorter struct {
+	keywordList [][]byte
+}
+
+func (s *keywordListSorter) Len() int {
+	return len(s.keywordList)
+}
+
+func (s *keywordListSorter) Less(i, j int) bool {
+	return bytes.Compare(s.keywordList[i], s.keywordList[j]) < 0
+}
+
+func (s *keywordListSorter) Swap(i, j int) {
+	s.keywordList[i], s.keywordList[j] = s.keywordList[j], s.keywordList[i]
+}
+
+func checkSSLKeyword(ip []byte, keywordSorter *keywordListSorter, timeout int) (bool, [][]byte) {
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Duration(timeout) * time.Second}, "tcp", string(ip)+":443", &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
-		return false
+		return false, nil
 	}
 	defer conn.Close()
-
 	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) > 0 {
-		subject := certs[0].Subject
-		if strings.Contains(subject.CommonName, keyword) ||
-			strings.Contains(strings.Join(subject.Organization, " "), keyword) ||
-			strings.Contains(strings.Join(subject.OrganizationalUnit, " "), keyword) {
-			return true
+	if certs == nil {
+		return false, nil
+	}
+	var matchedKeywords [][]byte
+	for _, cert := range certs {
+		var orgBytes [][]byte
+		for _, org := range cert.Subject.Organization {
+			orgBytes = append(orgBytes, []byte(org))
+		}
+		var orgUnitBytes [][]byte
+		for _, unit := range cert.Subject.OrganizationalUnit {
+			orgUnitBytes = append(orgUnitBytes, []byte(unit))
+		}
+		for _, keyword := range keywordSorter.keywordList {
+			if bytes.Contains([]byte(cert.Subject.CommonName), keyword) ||
+				bytes.Contains(bytes.Join(orgBytes, []byte(" ")), keyword) ||
+				bytes.Contains(bytes.Join(orgUnitBytes, []byte(" ")), keyword) {
+				matchedKeywords = append(matchedKeywords, keyword)
+			}
 		}
 	}
 
-	return false
+	return len(matchedKeywords) > 0, matchedKeywords
+}
+
+func writeIPToFile(filename string, ip []byte) error {
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(ip)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func incrementIP(ip net.IP) {
