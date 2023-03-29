@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/dgryski/go-pcgr"
-	"github.com/valyala/fasthttp"
 	"io"
 	"log"
 	"math/rand"
@@ -16,7 +14,11 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/dgryski/go-pcgr"
+	"github.com/valyala/fasthttp"
 )
 
 type IPRange struct {
@@ -116,6 +118,8 @@ func main() {
 	}
 
 	var ipChan chan []byte
+	var progressCounter int32
+	var totalIPs int
 
 	for dec.More() {
 		if err := dec.Decode(&ipRanges); err != nil {
@@ -124,6 +128,7 @@ func main() {
 			}
 			log.Fatalf("Error parsing JSON: %v", err)
 		}
+		totalIPs := len(ipRanges.Prefixes)
 		for _, prefix := range ipRanges.Prefixes {
 			params := checkIPRangeParams{
 				ipRange:     []byte(prefix.IPPrefix),
@@ -131,7 +136,7 @@ func main() {
 				timeout:     timeout,
 				verbose:     verbose,
 			}
-			go checkIPRange(params, numThreads, outputFile, ipChan)
+			go checkIPRange(params, numThreads, outputFile, ipChan, &progressCounter, totalIPs)
 		}
 	}
 	wg := &sync.WaitGroup{}
@@ -149,6 +154,8 @@ func main() {
 					}
 				}
 				fmt.Printf("%s\n", ip)
+				progress := atomic.AddInt32(&progressCounter, 1)
+				fmt.Printf("Progress: %d/%d\n", progress, totalIPs)
 			}
 		}()
 	}
@@ -158,7 +165,7 @@ func main() {
 
 }
 
-func checkIPRange(params checkIPRangeParams, numThreads int, outputFile string, ipChan chan<- []byte) {
+func checkIPRange(params checkIPRangeParams, numThreads int, outputFile string, ipChan chan<- []byte, progressCounter *int32, totalIPs int) {
 	_, ipNet, err := net.ParseCIDR(string(params.ipRange))
 	if err != nil {
 		return
